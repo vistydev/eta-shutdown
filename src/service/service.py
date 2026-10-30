@@ -9,7 +9,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from datetime import datetime
 
-from xidle import get_idle_time
 from logger import log
 
 """
@@ -25,6 +24,7 @@ minute = 00
 """
 
 CONFIG_FILE = "/etc/pardus/eta-shutdown.conf"
+XIDLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xidle.py")
 config = configparser.ConfigParser()
 config.read(CONFIG_FILE)
 
@@ -36,8 +36,29 @@ def check_time(hour, minute, delay):
 
 
 def check_x11(disp):
-    sp = subprocess.run(["env", "DISPLAY={}".format(disp), "xset", "-q"], capture_output=True)
+    # /tmp/.X11-unix is world writable, a display that never answers
+    # must not block the service
+    try:
+        sp = subprocess.run(["env", "DISPLAY={}".format(disp), "xset", "-q"],
+                            capture_output=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        return False
     return sp.returncode == 0
+
+
+def get_display_idle(disp):
+    # Same reason, ask in a child process with a timeout
+    try:
+        sp = subprocess.run([sys.executable, XIDLE, disp],
+                            capture_output=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        return None
+    if sp.returncode != 0:
+        return None
+    try:
+        return int(sp.stdout.decode().strip())
+    except ValueError:
+        return None
 
 ret = None
 def send_notify(message, yes_msg, no_msg, timeout):
@@ -93,10 +114,15 @@ def service():
     # timed shutdown
     mode = config["TIMED_MODE"]["mode"]
     if mode != "none":
+        # The machine is idle only if every display is idle, so use the
+        # smallest idle time. With the largest one an idle second session
+        # (or any display a user starts) powered off the active one.
         idle_time = -1
         for display in os.listdir("/tmp/.X11-unix/"):
-            idle = get_idle_time(f":{display[1:]}")
-            if idle_time < idle or idle_time < 0:
+            idle = get_display_idle(f":{display[1:]}")
+            if idle is None:
+                continue
+            if idle_time < 0 or idle < idle_time:
                 idle_time = idle
         print("idle_time: {}".format(idle_time))
         req_idle = (hour*3600 + minute * 60)*1000
